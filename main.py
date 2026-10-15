@@ -328,6 +328,9 @@ class Window(Gtk.Window):
         self.set_busy(False, "预览完成，请核对以下卸载范围。")
         text = "将移除：\n" + "\n".join("• " + item["id"] for item in p["removed"])
         text += "\n\n" + "\n".join(p["notes"])
+        stale = backend.user_loose(p.get("loose"), p["id"] if p.get("source") == "APT" else None)
+        if stale:
+            text += "\n\n同时清理你目录下残留的图标入口：\n" + "\n".join("• " + x for x in stale)
         self.preview.set_text(f"涉及 {len(p['removed'])} 个软件包 · 合计安装大小 {human_size(sum(i['size'] for i in p['removed']))}")
         dialog = Gtk.Dialog(title="确认卸载", transient_for=self, modal=True)
         dialog.set_default_size(560, 400)
@@ -391,6 +394,11 @@ class Window(Gtk.Window):
                 dialog.destroy()
                 return
             self.append_log("卸载完成。")
+            # 用户目录下的残留入口由当前用户自己删 —— 不丢给 root，
+            # 也不该在失败路径上删。
+            for path in backend.purge_loose(p.get("loose"), backend.user_menu_dirs(),
+                                            p["id"] if p.get("source") == "APT" else None):
+                self.append_log("已清理残留图标：" + path)
             self.set_busy(False)
             self.refresh()
         self.async_job(work, done)

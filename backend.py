@@ -33,6 +33,7 @@ class App:
     scope: str = "system"
     protected: bool = False
     description: str = ""
+    loose: list = dataclasses.field(default_factory=list)
 
     @property
     def key(self):
@@ -66,6 +67,186 @@ def protected_package(name, essential="", priority="", protected=""):
     return bool(essential == "yes" or protected == "yes" or
                 priority in ("required", "important") or
                 CRITICAL.match(name.split(":")[0]))
+
+
+DPKG_INFO = Path("/var/lib/dpkg/info")
+SYSTEM_MENU_DIRS = ("/usr/share/applications", "/usr/local/share/applications")
+
+
+def desktop_dirs():
+    """按优先级从低到高列出菜单目录：用户级覆盖系统级。"""
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    if not data.is_absolute():
+        data = Path.home() / ".local/share"
+    return [Path("/usr/local/share/applications"),
+            Path("/usr/share/applications"),
+            data / "applications"]
+
+
+def user_menu_dirs():
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    if not data.is_absolute():
+        data = Path.home() / ".local/share"
+    return (data / "applications",)
+
+
+def user_loose(paths, ident=None):
+    """loose 列表里属于当前用户目录的那些（供界面预览）。"""
+    try:
+        return [str(p) for p in loose_targets(paths, user_menu_dirs(), ident)]
+    except OSError:
+        return []
+
+
+def dpkg_owners(paths):
+    """路径 → 包名。分批调用，别把参数堆到超过 ARG_MAX。"""
+    owners = {}
+    items = [str(p) for p in paths]
+    for start in range(0, len(items), 200):
+        result = run(["/usr/bin/dpkg-query", "-S", *items[start:start + 200]],
+                     check=False)
+        for line in result.stdout.splitlines():
+            if ": /" in line:
+                owner, path = line.split(": ", 1)
+                owners[path] = owner.split(", ")[0]
+    return owners
+
+
+def package_entries(index):
+    """包自带的 .desktop —— /opt/<pkg>/entries/applications/ 这类。
+
+    这类包把入口留在自己的安装目录里，不往系统菜单目录放副本，
+    只扫 /usr/share/applications 就永远看不到它们（firefox-spark 就是）。
+    读包清单比遍历整个 /opt 便宜得多，也不依赖目录名长什么样。
+
+    只认 entries/applications/ 这一层：包清单里还有 /usr/share/gdm/
+    greeter/applications/ 这种组件内部的 .desktop，Exec 是个 no-op，
+    收进来会在卸载列表里多出一条用户根本没装过的"Dummy URI Handler"。
+
+    同时按文件名建一张表：菜单目录里那份同名副本虽然不归任何包，
+    但它显然是这个包的入口，卸载后同样要清掉。
+    """
+    found, by_name = [], {}
+    for pkg, files in index.items():
+        for path in files:
+            if path.endswith(".desktop") and "/entries/applications/" in path:
+                found.append(Path(path))
+                by_name.setdefault(Path(path).name, set()).add(pkg)
+    return found, by_name
+
+
+def desktop_exec(path):
+    """Exec= 的第一个词。只有绝对路径能拿去反查包。"""
+    try:
+        c = configparser.ConfigParser(interpolation=None, strict=False)
+        c.read(path, encoding="utf-8")
+        exe = c["Desktop Entry"].get("Exec", "").strip()
+    except (OSError, ValueError, configparser.Error, KeyError):
+        return ""
+    token = exe.split()[0] if exe else ""
+    return token if token.startswith("/") else ""
+
+
+def loose_targets(paths, roots, ident=None):
+    """筛出可以安全删除的游离 .desktop。
+
+    四道闸门同时成立才放行：位于给定菜单目录内、是普通文件或合规软链、
+    而且**不属于任何软件包**。第三条是硬闸门 —— 包拥有的文件必须留给
+    dpkg 处理，手删会让 dpkg 认为文件还在，下次升级/卸载行为就乱了。
+
+    软链另有一条：只有当它指向本次卸载**要删掉的那个文件**时才放行。
+    菜单目录里的软链常是包自带入口的别名（/usr/share/applications/
+    firefox-spark.desktop → /opt/.../entries/applications/ 同名文件），
+    包删掉目标后就剩一个点不开的断链。但软链指向哪都能指，不看目标就删
+    等于闭着眼睛删 —— unlink() 不会动目标，可也没必要去动别人的链接。
+    """
+    allowed = [str(Path(r).resolve()) for r in roots]
+    owned = set(dpkg_file_index().get(ident, [])) if ident else set()
+    ok = []
+    for raw in paths if isinstance(paths, (list, tuple)) else ():
+        if not isinstance(raw, str) or not raw or ".." in raw.split("/"):
+            continue
+        p = Path(os.path.normpath(raw))
+        if p.suffix != ".desktop":
+            continue
+        if p.is_symlink():
+            try:
+                if str(p.resolve()) not in owned:
+                    continue
+            except OSError:
+                continue
+        elif not p.is_file():
+            continue
+        if not any(str(p).startswith(root + "/") for root in allowed):
+            continue
+        if dpkg_owners([p]):
+            continue
+        ok.append(p)
+    return ok
+
+
+def purge_loose(paths, roots, ident=None):
+    removed = []
+    for p in loose_targets(paths, roots, ident):
+        try:
+            p.unlink()
+            removed.append(str(p))
+        except OSError:
+            continue
+    return removed
+
+
+def apt_files(ident):
+    result = run(["/usr/bin/dpkg-query", "-L", ident], check=False)
+    return [l for l in result.stdout.splitlines() if l.startswith("/")]
+
+
+SYSTEM_PREFIXES = ("/usr/", "/etc/", "/lib/", "/lib64/", "/bin/", "/sbin/", "/var/")
+
+
+def dpkg_file_index():
+    """包名 → 文件清单，一次读完全部 .list。
+
+    比每个包调一次 `dpkg-query -L` 便宜两个数量级（两千多个包 0.06s）。
+    文件清单本来就是两件关键判断的依据：Installed-Size 可不可信、
+    游离的 .desktop 归谁 —— 都得先知道这个包到底往系统里放了什么。
+    """
+    index = {}
+    if not DPKG_INFO.is_dir():
+        return index
+    for listing in sorted(DPKG_INFO.glob("*.list")):
+        try:
+            index[listing.name[:-5]] = [
+                line for line in listing.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.startswith("/")]
+        except OSError:
+            continue
+    return index
+
+
+def needs_measurement(files):
+    """包往系统目录之外放过东西，Installed-Size 就不可信。
+
+    装到 /opt 的应用把预编译目录整个塞进包里，打包时往往只算了一小部分，
+    元数据就成了 52K / 空值这种离谱数字。系统目录内的包不受影响。
+    """
+    return any(not f.startswith(SYSTEM_PREFIXES) for f in files)
+
+
+def measured_size(files, limit=20000):
+    """按 st_blocks 累加**包自己拥有的文件**求占用。
+
+    不去测目录：目录里可能混着别的包的文件，测目录会把别人的体积算进来。
+    """
+    if not files or len(files) > limit:
+        return 0
+    total = 0
+    for path in files:
+        try:
+            total += os.lstat(path).st_blocks * 512
+        except OSError:
+            continue
+    return total
 
 
 def desktop_meta(path):
@@ -102,6 +283,7 @@ def apt_size_bytes(text):
 def list_apt(all_packages=False):
     fmt = "${binary:Package}\t${db:Status-Abbrev}\t${Installed-Size}\t${Version}\t${Essential}\t${Priority}\t${Protected}\n"
     rows = run(["/usr/bin/dpkg-query", "-W", "-f=" + fmt]).stdout
+    index = dpkg_file_index()
     packages = {}
     for line in rows.splitlines():
         cols = line.split("\t")
@@ -110,26 +292,80 @@ def list_apt(all_packages=False):
         name, _, size, version, essential, priority, protected = cols
         packages[name] = App(name, name, "APT", version, apt_size_bytes(size),
                              protected=protected_package(name, essential, priority, protected))
-    files = sorted(Path("/usr/share/applications").glob("*.desktop"))
-    owners = {}
-    if files:
-        result = run(["/usr/bin/dpkg-query", "-S", *map(str, files)], check=False)
-        for line in result.stdout.splitlines():
-            if ": /" in line:
-                owner, path = line.split(": ", 1)
-                owners[path] = owner.split(", ")[0]
-    visible = set()
-    for f in files:
-        name = owners.get(str(f))
+    files, owners, loose = attribute_desktops(index)
+    visible = {}
+    for path in files:
+        name = owners.get(str(path))
         if name not in packages:
             continue
-        meta = desktop_meta(f)
-        if meta:
-            visible.add(name)
-            app = packages[name]
-            if app.name == app.id:
-                app.name, app.icon, app.description = meta
+        meta = desktop_meta(path)
+        if not meta:
+            continue
+        entry = visible.setdefault(name, {"meta": meta, "loose": set()})
+        # files 按优先级从低到高排，靠后的覆盖靠前的：
+        # 用户目录里的同名文件正是桌面实际用的那一份。
+        entry["meta"] = meta
+        if str(path) in loose:
+            entry["loose"].add(str(path))
+    for name, info in visible.items():
+        app = packages[name]
+        app.name, app.icon, app.description = info["meta"]
+        app.loose = sorted(info["loose"])
+        owned = index.get(name)
+        if owned is not None and (not app.size or needs_measurement(owned)):
+            app.size = measured_size(owned) or app.size
     return list(packages.values()) if all_packages else [packages[n] for n in visible]
+
+
+def attribute_desktops(index):
+    """候选 desktop 文件、每个文件对应的包名，以及游离的那批文件。
+
+    归属判定不能只看「这个 .desktop 归不归某个包」。装到 /opt 的应用
+    常把 .desktop 手工拷进菜单目录，dpkg 对这份拷贝不认账，于是整个应用
+    从列表里消失 —— qianwen、douyin 就是这么没的。判定分三级往下退：
+
+      1. dpkg 是否拥有这个文件本身；
+      2. Exec 指的可执行文件归哪个包（Exec=firefox 这种裸命令查不了，
+         它在 PATH 上，得靠下一级）；
+      3. 菜单目录里这份副本的文件名，和某个包自带的入口同名。
+
+    三级都查不到（手动装的、没有任何包）就照旧不列出来：没有包就没有
+    卸载计划，摆进列表只会让用户点进死路。
+
+    靠 2、3 级归属的文件是**游离**的：apt 卸载不会碰它们，包删完菜单里
+    就会留下一个点不开的入口，要单独记下来事后清理。
+    """
+    entries, by_name = package_entries(index)
+    ordered = list(entries)
+    for directory in desktop_dirs():
+        if directory.is_dir():
+            ordered.extend(sorted(directory.glob("*.desktop")))
+
+    files, seen = [], set()
+    for path in ordered:
+        if path.is_file() and str(path) not in seen:
+            seen.add(str(path))
+            files.append(path)
+
+    owned = {str(p) for p in entries}
+    owners = dpkg_owners(files)
+    loose = set()
+    for desktop in files:
+        key = str(desktop)
+        if key in owners or key in owned:
+            continue
+        candidates = by_name.get(desktop.name) or set()
+        exe = desktop_exec(desktop)
+        if exe:
+            owner = dpkg_owners([exe]).get(exe)
+            if owner:
+                owners[key] = owner
+                loose.add(key)
+                continue
+        if len(candidates) == 1:
+            owners[key] = next(iter(candidates))
+            loose.add(key)
+    return files, owners, loose
 
 
 def list_snap():
@@ -277,7 +513,8 @@ def plan(app, purge=False, delete_data=False):
             else:
                 notes.append("保留当前用户的全部应用数据。")
     payload = {"source": app.source, "id": app.id, "scope": app.scope,
-               "purge": bool(purge), "delete_data": bool(delete_data), "removed": removed}
+               "purge": bool(purge), "delete_data": bool(delete_data),
+               "removed": removed, "loose": sorted(app.loose)}
     return {**payload, "notes": notes, "name": app.name,
             "fingerprint": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}
 
@@ -301,7 +538,7 @@ def apply_command(p):
 
 
 def revalidate(p):
-    a = App(p["id"], p["name"], p["source"], scope=p["scope"])
+    a = App(p["id"], p["name"], p["source"], scope=p["scope"], loose=list(p.get("loose") or []))
     fresh = plan(a, p["purge"], p["delete_data"])
     if fresh["fingerprint"] != p["fingerprint"]:
         raise BackendError("卸载范围或软件版本已经变化，请重新预览并确认。")
@@ -327,6 +564,11 @@ def privileged_apply(p):
             print("卸载范围复核通过，正在执行…", flush=True)
             if not cache.commit(install_progress=apt.progress.base.InstallProgress()):
                 raise BackendError("软件管理器未完成操作，请查看日志。")
+            # 包删掉了，但它不拥有的菜单入口还在（装到 /opt 的应用常把
+            # .desktop 手工拷进 /usr/share/applications，又没有 postrm 收尾）。
+            # 不清掉的话菜单里会留一个点不开的图标。提交成功后才做。
+            for path in purge_loose(p.get("loose"), SYSTEM_MENU_DIRS, p["id"]):
+                print("已清理残留图标：" + path, flush=True)
     elif p["source"] == "Snap":
         revalidate(p)
         # Explicit save works even when automatic snapshots have been disabled.
